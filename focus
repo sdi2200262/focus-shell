@@ -1,21 +1,13 @@
 #!/bin/bash
-# focus - block distracting sites via /etc/hosts until a deadline.
+# focus - block distracting websites via /etc/hosts.
 #         Works on macOS and Linux.
-#
-# Usage:
-#   sudo focus start [hours]   # start a block (default 3h); hours must be a whole number > 0
-#   sudo focus add [hours]     # push the current deadline back by hours (default 3)
-#   sudo focus stop            # stop everything now
-#        focus status          # show whether a block is active and time left
-#
-# The deadline (unix epoch) is stored inline in the hosts marker, so add/status
-# read it back. Edit the DOMAINS list below to change which sites are blocked.
 set -euo pipefail
 
-HOSTS=/etc/hosts
-MARK_BEGIN="# focus-block BEGIN"   # full line is "<MARK_BEGIN> until=<epoch>"
+HOSTS="${FOCUS_HOSTS:-/etc/hosts}"
+CONF="${FOCUS_CONF:-/etc/focus.conf}"
+MARK_BEGIN="# focus-block BEGIN"
 MARK_END="# focus-block END"
-OS=$(uname)
+OS="$(uname)"
 
 DOMAINS=(
   instagram.com www.instagram.com
@@ -26,7 +18,10 @@ DOMAINS=(
   tiktok.com www.tiktok.com
 )
 
+# --- Helpers ---
+
 flush_dns() {
+  [[ "${FOCUS_TEST_MODE:-0}" == "1" ]] && return 0
   if [[ "$OS" == "Darwin" ]]; then
     dscacheutil -flushcache 2>/dev/null || true
     killall -HUP mDNSResponder 2>/dev/null || true
@@ -36,7 +31,6 @@ flush_dns() {
   fi
 }
 
-# In-place sed without a backup file (macOS requires '' as the backup suffix).
 sedi() {
   if [[ "$OS" == "Darwin" ]]; then
     sed -i '' "$@"
@@ -45,59 +39,162 @@ sedi() {
   fi
 }
 
-# Format an epoch timestamp as "H:MM AM/PM".
 fmt_epoch() {
   if [[ "$OS" == "Darwin" ]]; then
-    date -r "$1" '+%l:%M %p' | sed 's/^ *//'
+    date -r "$1" '+%l:%M %p' 2>/dev/null | sed 's/^ *//'
   else
-    date -d "@$1" '+%l:%M %p' | sed 's/^ *//'
+    date -d "@$1" '+%l:%M %p' 2>/dev/null | sed 's/^ *//'
   fi
 }
 
-# Delete the marker block. Matches the BEGIN line by prefix so the trailing
-# "until=<epoch>" is included in the range.
-strip_block() {
-  sedi "/^${MARK_BEGIN}/,/^${MARK_END}\$/d" "$HOSTS"
-}
-
-# Echo the stored deadline epoch, or nothing if no block is active.
-# The trailing "|| true" keeps a no-match grep from tripping set -e/pipefail.
-deadline_of() {
-  grep "^${MARK_BEGIN}" "$HOSTS" 2>/dev/null | head -1 | sed -E 's/.*until=([0-9]+).*/\1/' || true
-}
-
-# Format a seconds count as "Xh Ym", clamped to 0 if somehow negative.
 fmt_remaining() {
   local secs=$1
   ((secs < 0)) && secs=0
-  printf '%dh %dm' $((secs / 3600)) $(((secs % 3600) / 60))
+  local h=$((secs / 3600))
+  local m=$(((secs % 3600) / 60))
+  if ((h > 0)); then
+    printf '%dh %dm' "$h" "$m"
+  else
+    printf '%dm' "$m"
+  fi
+}
+
+current_min_of_day() {
+  local h m
+  h=$(date '+%H')
+  m=$(date '+%M')
+  echo $((10#$h * 60 + 10#$m))
 }
 
 require_root() {
+  [[ "${FOCUS_TEST_MODE:-0}" == "1" ]] && return 0
   if [[ $EUID -ne 0 ]]; then
-    echo "this command needs root: sudo focus $1" >&2
+    echo "This command requires root: sudo focus $1" >&2
     exit 1
   fi
 }
 
-validate_hours() {
-  if ! [[ "$1" =~ ^[1-9][0-9]*$ ]]; then
-    echo "error: hours must be a whole number greater than 0 (e.g. 1, 2, 24)" >&2
-    exit 1
+# --- Parsing ---
+
+# Parse duration string (e.g. 30m, 2h, 1h30m) into seconds.
+parse_duration() {
+  local str="$1"
+  if [[ -z "$str" ]]; then
+    return 1
+  fi
+
+  local total_secs=0
+  local matched=0
+
+  if [[ "$str" =~ ^([1-9][0-9]*)h(([1-9][0-9]*)m)?$ ]]; then
+    local hours="${BASH_REMATCH[1]}"
+    local mins="${BASH_REMATCH[3]:-0}"
+    total_secs=$((hours * 3600 + mins * 60))
+    matched=1
+  elif [[ "$str" =~ ^([1-9][0-9]*)m$ ]]; then
+    local mins="${BASH_REMATCH[1]}"
+    total_secs=$((mins * 60))
+    matched=1
+  fi
+
+  if ((matched == 0)); then
+    return 1
+  fi
+
+  echo "$total_secs"
+}
+
+# Parse 12-hour format into minutes from midnight (0..1439).
+# Valid examples: 9am, 12pm, 12am, 8:30am, 11:45pm. Case-insensitive.
+parse_time() {
+  local raw="$1"
+  local lower
+  lower=$(echo "$raw" | tr '[:upper:]' '[:lower:]')
+
+  if ! [[ "$lower" =~ ^(1[0-2]|[1-9])(:([0-5][0-9]))?(am|pm)$ ]]; then
+    return 1
+  fi
+
+  local hour="${BASH_REMATCH[1]}"
+  local min="${BASH_REMATCH[3]:-0}"
+  local meridiem="${BASH_REMATCH[4]}"
+
+  hour=$((10#$hour))
+  min=$((10#$min))
+
+  if [[ "$meridiem" == "am" ]]; then
+    if ((hour == 12)); then
+      hour=0
+    fi
+  else
+    if ((hour != 12)); then
+      hour=$((hour + 12))
+    fi
+  fi
+
+  echo $((hour * 60 + min))
+}
+
+# Parse a window string: <start>-<end> (e.g. 9am-5pm)
+# Echoes: "<start_min> <end_min>"
+parse_window() {
+  local raw="$1"
+  if ! [[ "$raw" =~ ^([^-]+)-([^-]+)$ ]]; then
+    return 1
+  fi
+
+  local s_raw="${BASH_REMATCH[1]}"
+  local e_raw="${BASH_REMATCH[2]}"
+
+  local s_min e_min
+  s_min=$(parse_time "$s_raw") || return 1
+  e_min=$(parse_time "$e_raw") || return 1
+
+  echo "$s_min $e_min"
+}
+
+# Returns 1 if check_min is inside [start_min, end_min), 0 otherwise.
+is_time_in_window() {
+  local s=$1 e=$2 cur=$3
+  if ((s < e)); then
+    if ((cur >= s && cur < e)); then
+      echo 1
+    else
+      echo 0
+    fi
+  else
+    # Spans midnight
+    if ((cur >= s || cur < e)); then
+      echo 1
+    else
+      echo 0
+    fi
   fi
 }
 
-# Write the block with the given deadline epoch and arm a detached timer that
-# strips it at that time. Kills any prior timer first so only one is ever live
-# (this is what makes double-start and add safe).
-arm() {
-  local deadline=$1 now
-  now=$(date +%s)
-  local seconds=$((deadline - now))
-  ((seconds < 0)) && seconds=0
+# Seconds until a minute-of-day edge from now
+secs_until_minute_of_day() {
+  local target_min=$1
+  local cur_min cur_sec
+  cur_min=$(current_min_of_day)
+  cur_sec=$(date '+%S')
+  cur_sec=$((10#$cur_sec))
 
-  pkill -f "${MARK_BEGIN}" 2>/dev/null || true
-  strip_block
+  local diff_mins=$((target_min - cur_min))
+  if ((diff_mins <= 0)); then
+    diff_mins=$((diff_mins + 1440))
+  fi
+
+  local total_secs=$((diff_mins * 60 - cur_sec))
+  ((total_secs < 1)) && total_secs=1
+  echo "$total_secs"
+}
+
+# --- Hosts Modification ---
+
+apply_hosts_block() {
+  local deadline="${1:-0}"
+  strip_hosts_block
   {
     echo "${MARK_BEGIN} until=${deadline}"
     for d in "${DOMAINS[@]}"; do
@@ -107,102 +204,493 @@ arm() {
     echo "$MARK_END"
   } >> "$HOSTS"
   flush_dns
-
-  nohup bash -c "
-    sleep ${seconds}
-    if [[ \"\$(uname)\" == 'Darwin' ]]; then
-      sed -i '' '/^${MARK_BEGIN}/,/^${MARK_END}\$/d' '${HOSTS}'
-      dscacheutil -flushcache 2>/dev/null || true
-      killall -HUP mDNSResponder 2>/dev/null || true
-    else
-      sed -i '/^${MARK_BEGIN}/,/^${MARK_END}\$/d' '${HOSTS}'
-      systemctl is-active --quiet systemd-resolved 2>/dev/null && resolvectl flush-caches 2>/dev/null || true
-      systemctl is-active --quiet nscd 2>/dev/null && nscd -i hosts 2>/dev/null || true
-    fi
-  " >/dev/null 2>&1 &
-  disown
 }
 
+strip_hosts_block() {
+  sedi "/^${MARK_BEGIN}/,/^${MARK_END}\$/d" "$HOSTS"
+  flush_dns
+}
+
+is_hosts_blocked() {
+  grep -q "^${MARK_BEGIN}" "$HOSTS" 2>/dev/null
+}
+
+# --- State Management ---
+
+STATE_MODE="none"
+STATE_TIMER_UNTIL=0
+STATE_SCHEDULE_TYPE=""
+STATE_SCHEDULE_WINDOW=""
+STATE_SCHEDULE_DAYS_UNTIL=0
+STATE_BREAK_UNTIL=0
+STATE_DAEMON_PID=0
+
+load_state() {
+  STATE_MODE="none"
+  STATE_TIMER_UNTIL=0
+  STATE_SCHEDULE_TYPE=""
+  STATE_SCHEDULE_WINDOW=""
+  STATE_SCHEDULE_DAYS_UNTIL=0
+  STATE_BREAK_UNTIL=0
+  STATE_DAEMON_PID=0
+
+  if [[ -f "$CONF" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONF" 2>/dev/null || true
+  fi
+}
+
+save_state() {
+  local mode="$1"
+  local timer_until="$2"
+  local sched_type="$3"
+  local sched_window="$4"
+  local sched_days_until="$5"
+  local break_until="$6"
+  local daemon_pid="${7:-0}"
+
+  cat << STATE_EOF > "$CONF"
+STATE_MODE="$mode"
+STATE_TIMER_UNTIL="$timer_until"
+STATE_SCHEDULE_TYPE="$sched_type"
+STATE_SCHEDULE_WINDOW="$sched_window"
+STATE_SCHEDULE_DAYS_UNTIL="$sched_days_until"
+STATE_BREAK_UNTIL="$break_until"
+STATE_DAEMON_PID="$daemon_pid"
+STATE_EOF
+}
+
+clear_state() {
+  rm -f "$CONF"
+}
+
+kill_daemon() {
+  load_state
+  if ((STATE_DAEMON_PID > 0)); then
+    kill "$STATE_DAEMON_PID" 2>/dev/null || true
+  fi
+  pkill -f "focus __daemon" 2>/dev/null || true
+}
+
+# --- Background Worker ---
+
+start_daemon() {
+  [[ "${FOCUS_TEST_MODE:-0}" == "1" ]] && return 0
+  kill_daemon
+  nohup "$0" __daemon >/dev/null 2>&1 &
+  local pid=$!
+  disown "$pid" 2>/dev/null || true
+
+  load_state
+  save_state "$STATE_MODE" "$STATE_TIMER_UNTIL" "$STATE_SCHEDULE_TYPE" "$STATE_SCHEDULE_WINDOW" "$STATE_SCHEDULE_DAYS_UNTIL" "$STATE_BREAK_UNTIL" "$pid"
+}
+
+cmd_daemon() {
+  while true; do
+    load_state
+
+    local now
+    now=$(date +%s)
+
+    # 1. Check schedule multi-day expiration
+    if [[ -n "$STATE_SCHEDULE_WINDOW" ]] && ((STATE_SCHEDULE_DAYS_UNTIL > 0 && now >= STATE_SCHEDULE_DAYS_UNTIL)); then
+      STATE_SCHEDULE_TYPE=""
+      STATE_SCHEDULE_WINDOW=""
+      STATE_SCHEDULE_DAYS_UNTIL=0
+    fi
+
+    # 2. Check ad-hoc timer expiration
+    if ((STATE_TIMER_UNTIL > 0 && now >= STATE_TIMER_UNTIL)); then
+      STATE_TIMER_UNTIL=0
+    fi
+
+    # 3. Check break expiration
+    if ((STATE_BREAK_UNTIL > 0 && now >= STATE_BREAK_UNTIL)); then
+      STATE_BREAK_UNTIL=0
+    fi
+
+    # 4. If neither timer nor schedule is active, exit
+    if ((STATE_TIMER_UNTIL == 0)) && [[ -z "$STATE_SCHEDULE_WINDOW" ]]; then
+      strip_hosts_block
+      clear_state
+      exit 0
+    fi
+
+    # 5. Determine whether sites should be blocked right now
+    local should_block=0
+    local next_wake=60
+
+    if ((STATE_BREAK_UNTIL > now)); then
+      should_block=0
+      local break_left=$((STATE_BREAK_UNTIL - now))
+      ((break_left < next_wake)) && next_wake=$break_left
+    elif ((STATE_TIMER_UNTIL > now)); then
+      should_block=1
+      local timer_left=$((STATE_TIMER_UNTIL - now))
+      ((timer_left < next_wake)) && next_wake=$timer_left
+    elif [[ -n "$STATE_SCHEDULE_WINDOW" ]]; then
+      local s_min e_min cur_min in_win
+      read -r s_min e_min <<< "$(parse_window "$STATE_SCHEDULE_WINDOW")"
+      cur_min=$(current_min_of_day)
+      in_win=$(is_time_in_window "$s_min" "$e_min" "$cur_min")
+
+      local until_s until_e
+      until_s=$(secs_until_minute_of_day "$s_min")
+      until_e=$(secs_until_minute_of_day "$e_min")
+
+      if [[ "$STATE_SCHEDULE_TYPE" == "allow" ]]; then
+        # Inside allow window -> unblocked; outside -> blocked
+        if ((in_win == 1)); then
+          should_block=0
+          ((until_e < next_wake)) && next_wake=$until_e
+        else
+          should_block=1
+          ((until_s < next_wake)) && next_wake=$until_s
+        fi
+      else
+        # Inside block window -> blocked; outside -> unblocked
+        if ((in_win == 1)); then
+          should_block=1
+          ((until_e < next_wake)) && next_wake=$until_e
+        else
+          should_block=0
+          ((until_s < next_wake)) && next_wake=$until_s
+        fi
+      fi
+    fi
+
+    if ((should_block == 1)); then
+      if ! is_hosts_blocked; then
+        apply_hosts_block "${STATE_TIMER_UNTIL:-0}"
+      fi
+    else
+      if is_hosts_blocked; then
+        strip_hosts_block
+      fi
+    fi
+
+    save_state "$STATE_MODE" "$STATE_TIMER_UNTIL" "$STATE_SCHEDULE_TYPE" "$STATE_SCHEDULE_WINDOW" "$STATE_SCHEDULE_DAYS_UNTIL" "$STATE_BREAK_UNTIL" "$$"
+
+    ((next_wake < 1)) && next_wake=1
+    ((next_wake > 60)) && next_wake=60
+
+    sleep "$next_wake"
+  done
+}
+
+# --- User Commands ---
+
 cmd_start() {
-  local hours="${1:-3}"
-  validate_hours "$hours"
+  local dur_arg="${1:-3h}"
+  local secs
+  if ! secs=$(parse_duration "$dur_arg"); then
+    echo "Invalid duration: $dur_arg. Use e.g. 30m, 2h, 1h30m." >&2
+    exit 1
+  fi
+
   require_root start
-  local now deadline
+  load_state
+
+  local now
   now=$(date +%s)
-  deadline=$(awk "BEGIN{printf \"%d\", $now + $hours*3600}")
-  arm "$deadline"
+  local deadline=$((now + secs))
+
+  apply_hosts_block "$deadline"
+  save_state "timer" "$deadline" "$STATE_SCHEDULE_TYPE" "$STATE_SCHEDULE_WINDOW" "$STATE_SCHEDULE_DAYS_UNTIL" 0 0
+  start_daemon
+
   local ends
   ends=$(fmt_epoch "$deadline")
   echo "Focus on."
-  echo "${#DOMAINS[@]} hostnames blocked."
-  echo "Ends ${ends} ($(fmt_remaining $((deadline - now))) left)."
-  echo "Extend: sudo focus add"
-  echo "Stop: sudo focus stop"
+  echo "${#DOMAINS[@]} websites blocked."
+  echo "Ends ${ends} ($(fmt_remaining "$secs") left)."
 }
 
 cmd_add() {
-  local hours="${1:-3}"
-  validate_hours "$hours"
-  require_root add
-  local current
-  current=$(deadline_of)
-  if [[ -z "$current" ]]; then
-    echo "no active focus block to extend; start one with: sudo focus start" >&2
+  local dur_arg="${1:-1h}"
+  local secs
+  if ! secs=$(parse_duration "$dur_arg"); then
+    echo "Invalid duration: $dur_arg. Use e.g. 30m, 1h, 1h30m." >&2
     exit 1
   fi
-  local now base deadline
+
+  require_root add
+  load_state
+
+  local now
   now=$(date +%s)
-  # Extend from the current deadline; if it has already lapsed, extend from now.
-  base=$((current > now ? current : now))
-  deadline=$(awk "BEGIN{printf \"%d\", $base + $hours*3600}")
-  arm "$deadline"
+
+  local base=$now
+  if ((STATE_TIMER_UNTIL > now)); then
+    base=$STATE_TIMER_UNTIL
+  fi
+
+  local deadline=$((base + secs))
+  apply_hosts_block "$deadline"
+  save_state "timer" "$deadline" "$STATE_SCHEDULE_TYPE" "$STATE_SCHEDULE_WINDOW" "$STATE_SCHEDULE_DAYS_UNTIL" "$STATE_BREAK_UNTIL" 0
+  start_daemon
+
   local ends
   ends=$(fmt_epoch "$deadline")
-  echo "Added ${hours}h."
+  echo "Added ${dur_arg}."
   echo "Now ends ${ends} ($(fmt_remaining $((deadline - now))) left)."
+}
+
+cmd_schedule() {
+  local sched_type=""
+  local window=""
+  local days=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --allow)
+        sched_type="allow"
+        window="$2"
+        shift 2
+        ;;
+      --block)
+        sched_type="block"
+        window="$2"
+        shift 2
+        ;;
+      --days)
+        if ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
+          echo "Error: --days must be a whole number greater than 0." >&2
+          exit 1
+        fi
+        days="$2"
+        shift 2
+        ;;
+      *)
+        echo "Unknown option: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  if [[ -z "$sched_type" || -z "$window" ]]; then
+    echo "Usage: sudo focus schedule {--allow|--block} <start-end> [--days N]" >&2
+    echo "Example: sudo focus schedule --allow 9pm-11pm" >&2
+    exit 1
+  fi
+
+  if ! parse_window "$window" >/dev/null; then
+    echo "Invalid time window: $window. Use 12-hour am/pm format (e.g. 9pm-11pm, 9am-5pm)." >&2
+    exit 1
+  fi
+
+  require_root schedule
+  load_state
+
+  local now
+  now=$(date +%s)
+  local days_until=0
+  if ((days > 0)); then
+    days_until=$((now + days * 86400))
+  fi
+
+  local s_min e_min cur_min in_win
+  read -r s_min e_min <<< "$(parse_window "$window")"
+  cur_min=$(current_min_of_day)
+  in_win=$(is_time_in_window "$s_min" "$e_min" "$cur_min")
+
+  save_state "schedule" "$STATE_TIMER_UNTIL" "$sched_type" "$window" "$days_until" 0 0
+
+  local should_block=0
+  if [[ "$sched_type" == "allow" ]]; then
+    ((in_win == 0)) && should_block=1
+  else
+    ((in_win == 1)) && should_block=1
+  fi
+
+  if ((should_block == 1)); then
+    apply_hosts_block 0
+    echo "Schedule set: ${sched_type} ${window}."
+    echo "Currently in blocked period. Focus on."
+  else
+    strip_hosts_block
+    echo "Schedule set: ${sched_type} ${window}."
+    echo "Currently in allowed period. Websites unblocked."
+  fi
+
+  start_daemon
+}
+
+cmd_break() {
+  local dur_arg="${1:-30m}"
+  local secs
+  if ! secs=$(parse_duration "$dur_arg"); then
+    echo "Invalid duration: $dur_arg. Use e.g. 15m, 30m, 1h." >&2
+    exit 1
+  fi
+
+  require_root break
+  load_state
+
+  local now
+  now=$(date +%s)
+
+  if ((STATE_TIMER_UNTIL <= now)) && [[ -z "$STATE_SCHEDULE_WINDOW" ]]; then
+    echo "No focus session active. No break needed."
+    return 0
+  fi
+
+  local timer_until=$STATE_TIMER_UNTIL
+  if ((timer_until > now)); then
+    timer_until=$((timer_until + secs))
+  fi
+
+  local break_until=$((now + secs))
+  strip_hosts_block
+
+  save_state "$STATE_MODE" "$timer_until" "$STATE_SCHEDULE_TYPE" "$STATE_SCHEDULE_WINDOW" "$STATE_SCHEDULE_DAYS_UNTIL" "$break_until" 0
+  start_daemon
+
+  local ends
+  ends=$(fmt_epoch "$break_until")
+  echo "Break started for ${dur_arg}."
+  echo "Websites unblocked until ${ends}."
+}
+
+cmd_resume() {
+  require_root resume
+  load_state
+
+  local now
+  now=$(date +%s)
+
+  if ((STATE_BREAK_UNTIL <= now)); then
+    echo "Not currently on break."
+    return 0
+  fi
+
+  save_state "$STATE_MODE" "$STATE_TIMER_UNTIL" "$STATE_SCHEDULE_TYPE" "$STATE_SCHEDULE_WINDOW" "$STATE_SCHEDULE_DAYS_UNTIL" 0 0
+  start_daemon
+
+  echo "Break ended. Resuming focus."
+  if ((STATE_TIMER_UNTIL > now)); then
+    apply_hosts_block "$STATE_TIMER_UNTIL"
+  elif [[ -n "$STATE_SCHEDULE_WINDOW" ]]; then
+    local s_min e_min cur_min in_win should_block=0
+    read -r s_min e_min <<< "$(parse_window "$STATE_SCHEDULE_WINDOW")"
+    cur_min=$(current_min_of_day)
+    in_win=$(is_time_in_window "$s_min" "$e_min" "$cur_min")
+    if [[ "$STATE_SCHEDULE_TYPE" == "allow" ]]; then
+      ((in_win == 0)) && should_block=1
+    else
+      ((in_win == 1)) && should_block=1
+    fi
+    if ((should_block == 1)); then
+      apply_hosts_block 0
+    fi
+  fi
 }
 
 cmd_stop() {
   require_root stop
-  if [[ -z "$(deadline_of)" ]]; then
-    echo "Focus already off; nothing to stop."
-    return 0
-  fi
-  pkill -f "${MARK_BEGIN}" 2>/dev/null || true
-  strip_block
-  flush_dns
-  echo "Focus off. Everything unblocked."
+  kill_daemon
+  strip_hosts_block
+  clear_state
+  echo "Focus off. All blocks, schedules, and breaks cleared."
 }
 
 cmd_status() {
-  local deadline
-  deadline=$(deadline_of)
-  if [[ -z "$deadline" ]]; then
-    echo "Off."
-    echo "No focus block active."
-    return 0
-  fi
-  local now ends
+  load_state
+  local now
   now=$(date +%s)
-  ends=$(fmt_epoch "$deadline")
-  echo "On."
-  echo "Ends ${ends} ($(fmt_remaining $((deadline - now))) left)."
-  echo "Blocked hostnames:"
-  sed -n "/^${MARK_BEGIN}/,/^${MARK_END}\$/p" "$HOSTS" \
-    | grep '^127\.0\.0\.1' | awk '{print "  " $2}'
+
+  local has_block=0
+  is_hosts_blocked && has_block=1
+
+  if ((STATE_BREAK_UNTIL > now)); then
+    echo "Status: On break ($(fmt_remaining $((STATE_BREAK_UNTIL - now))) left)."
+    echo "Break ends: $(fmt_epoch "$STATE_BREAK_UNTIL")."
+  elif ((has_block == 1)); then
+    echo "Status: Focus on."
+  else
+    echo "Status: Focus off."
+  fi
+
+  if ((STATE_TIMER_UNTIL > now)); then
+    echo "Timer: $(fmt_epoch "$STATE_TIMER_UNTIL") ($(fmt_remaining $((STATE_TIMER_UNTIL - now))) left)."
+  fi
+
+  if [[ -n "$STATE_SCHEDULE_WINDOW" ]]; then
+    local sched_info="Schedule: Daily ${STATE_SCHEDULE_TYPE} ${STATE_SCHEDULE_WINDOW}"
+    if ((STATE_SCHEDULE_DAYS_UNTIL > 0)); then
+      local days_left=$(((STATE_SCHEDULE_DAYS_UNTIL - now + 86399) / 86400))
+      sched_info="${sched_info} (${days_left}d remaining)"
+    fi
+    echo "$sched_info."
+  fi
+
+  if ((has_block == 1)); then
+    echo "Blocked websites:"
+    sed -n "/^${MARK_BEGIN}/,/^${MARK_END}\$/p" "$HOSTS"       | grep '^127\.0\.0\.1' | awk '{print "  " $2}'
+  fi
 }
 
+usage() {
+  cat << 'USAGE_EOF'
+focus - block distracting websites via /etc/hosts
+
+USAGE
+    focus status
+    sudo focus start [duration]
+    sudo focus add [duration]
+    sudo focus schedule {--allow|--block} <start-end> [--days N]
+    sudo focus break [duration]
+    sudo focus resume
+    sudo focus stop
+
+COMMANDS
+    status
+        Show current state, remaining time, and blocked sites.
+
+    start [duration]
+        Block sites immediately for duration (e.g. 3h, 45m, 1h30m). Default: 3h.
+
+    add [duration]
+        Extend current deadline by duration. Default: 1h.
+
+    schedule {--allow|--block} <start-end> [--days N]
+        --allow: Allow sites during this window; block all other times.
+        --block: Block sites during this window; allow all other times.
+        Optionally stop after N days. Default: runs until stopped.
+        Example: sudo focus schedule --allow 9pm-11pm
+
+    break [duration]
+        Temporarily unblock sites for duration (e.g. 30m, 1h). Default: 30m.
+        Automatically resumes blocking when finished.
+
+    resume
+        End active break immediately and restore blocking.
+
+    stop
+        Stop all blocks, breaks, and schedules. Unblock immediately.
+
+FORMATS
+    duration    Whole numbers with 'h' or 'm' (e.g. 30m, 2h, 1h30m).
+    time        12-hour local time: 9am, 5pm, 12am, 12pm, 8:30am, 9:15pm.
+USAGE_EOF
+}
+
+if [[ "${FOCUS_SOURCE_ONLY:-0}" == "1" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 case "${1:-}" in
-  start)  shift; cmd_start "$@" ;;
-  add)    shift; cmd_add "$@" ;;
-  stop)   cmd_stop ;;
-  status) cmd_status ;;
+  start)    shift; cmd_start "$@" ;;
+  add)      shift; cmd_add "$@" ;;
+  schedule) shift; cmd_schedule "$@" ;;
+  break)    shift; cmd_break "$@" ;;
+  resume)   cmd_resume ;;
+  stop)     cmd_stop ;;
+  status)   cmd_status ;;
+  __daemon) cmd_daemon ;;
+  -h|--help|help) usage ;;
   *)
-    echo "usage: focus {start [hours]|add [hours]|stop|status}" >&2
-    echo "  sudo focus start 3   # block for 3 hours (whole number > 0)" >&2
-    echo "  sudo focus add 2     # push deadline back 2 more hours (whole number > 0)" >&2
-    echo "  sudo focus stop      # stop everything now" >&2
-    echo "       focus status    # show state and time left" >&2
+    usage >&2
     exit 1
     ;;
 esac

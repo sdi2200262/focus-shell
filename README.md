@@ -1,41 +1,51 @@
 # focus-shell
 
-A minimal bash script that blocks distracting sites via `/etc/hosts` for a set number of hours. Works on macOS and Linux.
+A minimal bash script that blocks distracting websites via `/etc/hosts`. Works on macOS and Linux.
+
+Appends a marked block to `/etc/hosts` redirecting domains to `127.0.0.1`. A lightweight background process manages schedule windows, timer expirations, and breaks. Runs without external dependencies on both macOS and Linux.
 
 ## Usage
 
-```
-sudo focus start [hours]   # start a block (default 3h)
-sudo focus add [hours]     # extend the current deadline (default +3h)
-sudo focus stop            # unblock everything now
-     focus status          # show time remaining and blocked sites
+```text
+focus status                                           # show state, time left, and blocked sites
+sudo focus start [duration]                            # block immediately (default: 3h)
+sudo focus add [duration]                              # extend deadline (default: 1h)
+sudo focus schedule {--allow|--block} <range> [--days] # recurring schedule (e.g. --allow 9pm-11pm)
+sudo focus break [duration]                            # pause blocking (default: 30m)
+sudo focus resume                                      # end break early, resume blocking
+sudo focus stop                                        # unblock everything now
 ```
 
-`hours` must be a whole number greater than 0.
+## Formats
+
+- **Duration**: Whole numbers with `h` or `m` (e.g. `30m`, `2h`, `1h30m`).
+- **Scheudle Time**: 12-hour local time with am/pm (e.g. `9am`, `5pm`, `12am`, `12pm`, `8:30am`, `9:15pm`).
 
 ## Install
 
+Place the `focus` executable somewhere in your `PATH` (e.g. `~/.local/bin` or `/usr/local/bin`):
+
 ```bash
+# Clone and symlink:
+ln -s "$PWD/focus" ~/.local/bin/focus
+
+# Or download directly:
 curl -fsSL https://raw.githubusercontent.com/sdi2200262/focus-shell/main/focus \
   -o /usr/local/bin/focus && chmod +x /usr/local/bin/focus
-```
-
-Or clone and symlink:
-
-```bash
-git clone https://github.com/sdi2200262/focus-shell.git
-ln -s "$PWD/focus-shell/focus" /usr/local/bin/focus
 ```
 
 ## Blocked sites
 
 Edit the `DOMAINS` array at the top of the script to customize. Defaults:
-
 - Instagram, Reddit, LinkedIn, X/Twitter, Facebook, TikTok
 
-## How it works
+## Tests
 
-Appends a marked block to `/etc/hosts` that redirects the domains to `127.0.0.1`. A detached background process removes the block when the deadline expires. The deadline survives reboots — if the machine is off when the timer fires, the block is removed on the next `focus stop` or `focus start`.
+Run the isolated test suite:
+
+```bash
+bash test/test_focus.sh
+```
 
 ## License
 
