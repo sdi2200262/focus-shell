@@ -16,6 +16,7 @@ DOMAINS=(
   x.com www.x.com twitter.com www.twitter.com
   facebook.com www.facebook.com m.facebook.com
   tiktok.com www.tiktok.com
+  youtube.com www.youtube.com m.youtube.com youtu.be
 )
 
 # --- Helpers ---

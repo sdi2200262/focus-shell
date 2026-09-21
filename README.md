@@ -37,7 +37,7 @@ curl -fsSL https://raw.githubusercontent.com/sdi2200262/focus-shell/main/focus \
 ## Blocked sites
 
 Edit the `DOMAINS` array at the top of the script to customize. Defaults:
-- Instagram, Reddit, LinkedIn, X/Twitter, Facebook, TikTok
+- Instagram, Reddit, LinkedIn, X/Twitter, Facebook, TikTok, YouTube
 
 ## Tests
 
